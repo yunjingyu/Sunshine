@@ -62,6 +62,14 @@ namespace platf {
     });
   }
 
+  bool request_system_audio_permission() {
+    AVAudio *probe = [[AVAudio alloc] init];
+    probe.hostAudioEnabled = YES;
+    const bool started = [probe setupSystemTap:48000 frameSize:512 channels:2] == 0;
+    [probe release];
+    return started;
+  }
+
   /**
    * @brief Real-time AudioConverter input callback for format conversion.
    * Provides audio data to AudioConverter during format conversion process using pure C++ for optimal performance.

@@ -51,6 +51,7 @@
 #include "src/globals.h"
 #include "src/logging.h"
 #include "src/platform/common.h"
+#include "src/platform/permissions.h"
 #include "src/utility.h"
 #include "utf_utils.h"
 
@@ -124,6 +125,17 @@ namespace bp = boost::process::v1;
 using namespace std::literals;
 
 namespace platf {
+  std::vector<permission_status_t> get_permission_statuses() {
+    return {{"config_directory", can_access_directory(appdata()) ? "granted" : "denied", true, true}};
+  }
+
+  bool request_permission(std::string_view id) {
+    // Windows does not offer a consent prompt for arbitrary directory ACLs.
+    // The Web UI shows the setup steps for this known permission.
+    (void) id;
+    return false;
+  }
+
   /**
    * @brief Owning pointer for `GetAdaptersAddresses` results.
    */

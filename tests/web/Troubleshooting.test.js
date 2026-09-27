@@ -7,8 +7,8 @@ vi.mock('../../src_assets/common/assets/web/Navbar.vue', () => ({
 
 import Troubleshooting from '../../src_assets/common/assets/web/Troubleshooting.vue'
 
-async function mountTroubleshooting(platform, gamepadDriver, licenseStatus = {}) {
-  vi.stubGlobal('fetch', vi.fn(async url => {
+async function mountTroubleshooting(platform, gamepadDriver, licenseStatus = {}, permissions = []) {
+  vi.stubGlobal('fetch', vi.fn(async (url) => {
     if (url === '/api/config') {
       return { json: async () => ({ platform, gamepad_driver: gamepadDriver }) }
     }
@@ -27,6 +27,12 @@ async function mountTroubleshooting(platform, gamepadDriver, licenseStatus = {})
     }
     if (url === '/api/virtual-input/license') {
       return { ok: true, json: async () => ({ service_available: true, state: 'licensed', licensed: true, ...licenseStatus }) }
+    }
+    if (url === './api/permissions') {
+      return { ok: true, json: async () => ({ permissions }) }
+    }
+    if (url === './api/permissions/request') {
+      return { ok: true, json: async () => ({ status: true }) }
     }
     if (url === './api/logs') {
       return { text: async () => '' }
@@ -55,6 +61,49 @@ afterEach(() => {
 })
 
 describe('virtual input troubleshooting', () => {
+  it('shows macOS permission status and requests access from the row button', async () => {
+    const wrapper = await mountTroubleshooting('macos', 'all', {}, [
+      { id: 'screen_recording', status: 'denied', required: true, requestable: true },
+      { id: 'notifications', status: 'granted', required: false },
+      { id: 'system_audio', status: 'on_use', required: true, requestable: true },
+    ])
+
+    expect(wrapper.get('#permissions').text()).toBe('troubleshooting.permissions_title')
+    const card = wrapper.findAll('.card').find(item => item.find('#permissions').exists())
+    expect(card.findAll('li.list-group-item')).toHaveLength(3)
+    expect(wrapper.text()).toContain('troubleshooting.permissions_status_on_use')
+    expect(card.findAll('li.list-group-item button')).toHaveLength(2)
+    const screenRow = card.findAll('li.list-group-item').find(row => row.text().includes('permission_screen_recording'))
+    await screenRow.get('button').trigger('click')
+    await flushPromises()
+    expect(fetch).toHaveBeenCalledWith('./api/permissions/request', expect.objectContaining({
+      method: 'POST',
+      body: JSON.stringify({ id: 'screen_recording' }),
+    }))
+    wrapper.unmount()
+  })
+
+  it('shows Windows directory access with setup steps', async () => {
+    const wrapper = await mountTroubleshooting('windows', 'all', {}, [
+      { id: 'config_directory', status: 'denied', required: true, verifiable: true, requestable: false },
+    ])
+    expect(wrapper.find('#permissions').exists()).toBe(true)
+    const row = wrapper.get('li.list-group-item')
+    await row.get('button').trigger('click')
+    expect(row.text()).toContain('troubleshooting.permission_config_directory_help')
+    expect(fetch).not.toHaveBeenCalledWith('./api/permissions/request', expect.anything())
+    wrapper.unmount()
+  })
+
+  it('shows Linux input setup steps', async () => {
+    const wrapper = await mountTroubleshooting('linux', 'none', {}, [
+      { id: 'input', status: 'denied', required: true, verifiable: true, requestable: false },
+    ])
+    await wrapper.get('li.list-group-item button').trigger('click')
+    expect(wrapper.text()).toContain('troubleshooting.permission_input_help_linux')
+    wrapper.unmount()
+  })
+
   it('shows the broker version table without ViGEmBus on macOS', async () => {
     const wrapper = await mountTroubleshooting('macos', 'all')
 

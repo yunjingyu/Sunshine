@@ -2,6 +2,50 @@
   <Navbar></Navbar>
   <div id="content" class="container">
     <h1 class="my-4">{{ $t('troubleshooting.troubleshooting') }}</h1>
+    <div class="card my-4" v-if="permissions.length || permissionError">
+      <div class="card-body">
+        <div class="d-flex align-items-center justify-content-between gap-3 flex-wrap mb-2">
+          <h2 id="permissions" class="mb-0">{{ $t('troubleshooting.permissions_title') }}</h2>
+          <button class="btn btn-outline-secondary" type="button" @click="refreshPermissions">
+            <refresh-cw :size="17" class="icon"></refresh-cw>
+            {{ $t('troubleshooting.permissions_refresh') }}
+          </button>
+        </div>
+        <p>{{ $t('troubleshooting.permissions_desc') }}</p>
+        <div v-if="permissionError" class="alert alert-danger" role="alert">{{ permissionError }}</div>
+        <ul class="list-group">
+          <li v-for="permission in permissions" :key="permission.id"
+              class="list-group-item d-flex align-items-center justify-content-between gap-3 flex-wrap">
+            <div>
+              <strong>{{ $t('troubleshooting.permission_' + permission.id +
+                (permission.id === 'input' && (platform === 'linux' || platform === 'freebsd') ? '_unix' : '')) }}</strong>
+              <span class="badge ms-2" :class="permission.required ? 'text-bg-primary' : 'text-bg-secondary'">
+                {{ $t(permission.required ? 'troubleshooting.permissions_required' : 'troubleshooting.permissions_optional') }}
+              </span>
+              <p class="mb-1">{{ $t('troubleshooting.permission_' + permission.id + '_desc' +
+                (permission.id === 'input' && (platform === 'linux' || platform === 'freebsd') ? '_unix' : '')) }}</p>
+              <p v-if="permissionHelp === permission.id" class="mb-1" role="status">
+                {{ $t('troubleshooting.permission_' + permission.id + '_help' +
+                  (permission.id === 'input' && platform !== 'macos' ? '_' + platform : '')) }}
+              </p>
+              <span :class="permission.status === 'granted' ? 'text-success' : 'text-warning'">
+                {{ $t('troubleshooting.permissions_status_' + permission.status) }}
+              </span>
+            </div>
+            <button v-if="permission.status !== 'granted' && permission.requestable" class="btn btn-outline-primary"
+                    type="button" :disabled="permissionBusy === permission.id"
+                    @click="requestPermission(permission.id)">
+              {{ $t(permission.id === 'local_network'
+                ? 'troubleshooting.permissions_settings' : 'troubleshooting.permissions_request') }}
+            </button>
+            <button v-else-if="permission.status !== 'granted'" class="btn btn-outline-primary"
+                    type="button" @click="permissionHelp = permissionHelp === permission.id ? '' : permission.id">
+              {{ $t('troubleshooting.permissions_instructions') }}
+            </button>
+          </li>
+        </ul>
+      </div>
+    </div>
     <!-- Virtual gamepad broker and license -->
     <div class="card my-4 virtual-gamepad-card" v-if="platform === 'windows' || platform === 'macos'">
       <div class="card-body">
@@ -509,6 +553,10 @@
           licenseKey: '',
           portalResetPressed: false,
           portalResetStatus: null,
+          permissions: [],
+          permissionBusy: '',
+          permissionError: '',
+          permissionHelp: '',
           restartPressed: false,
           showApplyMessage: false,
           platform: "",
@@ -715,6 +763,7 @@
           .then((r) => {
             this.platform = r.platform;
             this.gamepadDriver = r.gamepad_driver || '';
+            this.refreshPermissions();
             // The Windows broker also backs relative mouse input when gamepads are disabled.
             if (this.platform === 'windows' || this.platform === 'macos') {
               this.refreshDriverInformation();
@@ -726,6 +775,7 @@
 
         this.logInterval = setInterval(() => {
           this.refreshLogs();
+          if (this.platform) this.refreshPermissions();
         }, 5000);
         this.refreshLogs();
         this.refreshClients();
@@ -735,6 +785,34 @@
         if (this._logsCopyTimeout) clearTimeout(this._logsCopyTimeout);
       },
       methods: {
+        /** Refresh the current platform's permission status. */
+        async refreshPermissions() {
+          try {
+            const response = await fetch('./api/permissions');
+            if (!response.ok) throw new Error(this.$t('troubleshooting.permissions_error'));
+            this.permissions = (await response.json()).permissions || [];
+            this.permissionError = '';
+          } catch (error) {
+            this.permissionError = error.message;
+          }
+        },
+        /** Initiate the selected native permission action. */
+        async requestPermission(id) {
+          this.permissionBusy = id;
+          try {
+            const response = await apiFetch('./api/permissions/request', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ id }),
+            });
+            if (!response.ok) throw new Error(this.$t('troubleshooting.permissions_error'));
+            await this.refreshPermissions();
+          } catch (error) {
+            this.permissionError = error.message;
+          } finally {
+            this.permissionBusy = '';
+          }
+        },
         refreshLogs() {
           fetch("./api/logs",)
             .then((r) => r.text())
