@@ -22,6 +22,7 @@
 
 // local includes
 #include "audio.h"
+#include "display_device_revert.h"
 #include "platform/common.h"
 #include "rtsp.h"
 
@@ -165,6 +166,36 @@ namespace display_device {
           return "DisplayModePrepFailed";
         case HdrStatePrepFailed:
           return "HdrStatePrepFailed";
+        case PersistenceSaveFailed:
+          return "PersistenceSaveFailed";
+      }
+
+      return "Unknown";
+    }
+
+    /**
+     * @brief Name a restore outcome for actionable diagnostics.
+     * @param result Outcome returned by the settings manager.
+     * @return Stable diagnostic name for the outcome.
+     */
+    std::string_view revert_result_name(SettingsManagerInterface::RevertResult result) {
+      using enum SettingsManagerInterface::RevertResult;
+
+      switch (result) {
+        case Ok:
+          return "Ok";
+        case ApiTemporarilyUnavailable:
+          return "ApiTemporarilyUnavailable";
+        case TopologyIsInvalid:
+          return "TopologyIsInvalid";
+        case SwitchingTopologyFailed:
+          return "SwitchingTopologyFailed";
+        case RevertingPrimaryDeviceFailed:
+          return "RevertingPrimaryDeviceFailed";
+        case RevertingDisplayModesFailed:
+          return "RevertingDisplayModesFailed";
+        case RevertingHdrStatesFailed:
+          return "RevertingHdrStatesFailed";
         case PersistenceSaveFailed:
           return "PersistenceSaveFailed";
       }
@@ -706,56 +737,22 @@ namespace display_device {
         return;
       }
 
-      // Note: by default the executor function is immediately executed in the calling thread. With delay, we want to avoid that.
-      SchedulerOptions scheduler_option {.m_sleep_durations = {DEFAULT_RETRY_INTERVAL}};
-      if (option == revert_option_e::try_indefinitely_with_delay && DD_DATA.config_revert_delay > std::chrono::milliseconds::zero()) {
-        scheduler_option.m_sleep_durations = {DD_DATA.config_revert_delay, DEFAULT_RETRY_INTERVAL};
-        scheduler_option.m_execution = SchedulerOptions::Execution::ScheduledOnly;
-      }
-
-      DD_DATA.sm_instance->schedule([try_once = (option == revert_option_e::try_once), tried_out_devices = StringSet {}](auto &settings_iface, auto &stop_token) mutable {
-        if (try_once) {
-          std::ignore = settings_iface.revertSettings();
-          stop_token.requestStop();
-          return;
-        }
-
-        auto available_devices {[&settings_iface]() {
-          const auto devices {settings_iface.enumAvailableDevices()};
-          StringSet parsed_devices;
-
-          std::transform(
-            std::begin(devices),
-            std::end(devices),
-            std::inserter(parsed_devices, std::end(parsed_devices)),
-            [](const auto &device) {
-              return device.m_device_id + " - " + device.m_friendly_name;
-            }
-          );
-
-          return parsed_devices;
-        }()};
-        if (available_devices == tried_out_devices) {
-          BOOST_LOG(debug) << "Skipping reverting configuration, because no newly added/removed devices were detected since last check. Currently available devices:\n"
-                           << toJson(available_devices);
-          return;
-        }
-
-        using enum SettingsManagerInterface::RevertResult;
-        if (const auto result {settings_iface.revertSettings()}; result == Ok) {
-          stop_token.requestStop();
-          return;
-        } else if (result == ApiTemporarilyUnavailable) {
-          // Do nothing and retry next time
-          return;
-        }
-
-        // If we have failed to revert settings then we will try to do it next time only if a device was added/removed
-        BOOST_LOG(warning) << "Failed to revert display device configuration (will retry once devices are added or removed). Enabling all of the available devices:\n"
-                           << toJson(available_devices);
-        tried_out_devices.swap(available_devices);
-      },
-                                    scheduler_option);
+      const auto initial_delay {option == revert_option_e::try_indefinitely_with_delay ? DD_DATA.config_revert_delay : std::chrono::milliseconds::zero()};
+      const auto scheduler_options {detail::make_revert_scheduler_options(initial_delay)};
+      DD_DATA.sm_instance->schedule(
+        detail::make_revert_callback(option == revert_option_e::try_once, [](const auto result, const auto &next_retry) {
+          if (result == SettingsManagerInterface::RevertResult::Ok) {
+            BOOST_LOG(info) << "Display device configuration restore completed.";
+          } else if (next_retry) {
+            BOOST_LOG(warning) << "Failed to restore display device configuration: " << revert_result_name(result)
+                               << ". Will retry in " << next_retry->count() << " ms, even if the available devices are unchanged.";
+          } else {
+            BOOST_LOG(warning) << "Final display device configuration restore attempt failed: " << revert_result_name(result)
+                               << ". Recovery will be retried at the next startup if persisted state remains.";
+          }
+        }),
+        scheduler_options
+      );
     }
   }  // namespace
 

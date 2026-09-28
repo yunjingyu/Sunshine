@@ -15,7 +15,7 @@
 	url = https://github.com/Dav1dde/glad.git
 [submodule "third-party/libdisplaydevice"]
 	path = third-party/libdisplaydevice
-	url = https://github.com/LizardByte/libdisplaydevice.git
+	url = https://github.com/yunjingyu/libdisplaydevice.git
 	branch = master
 [submodule "third-party/libvirtualhid"]
 	path = third-party/libvirtualhid
