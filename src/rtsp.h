@@ -50,8 +50,15 @@ namespace rtsp_stream {
    * @brief Queue a launch session until the RTSP client connects.
    *
    * @param launch_session Session state prepared by the GameStream launch handler.
+   * @return True if accepted, or false when an earlier launch is still pending.
    */
-  void launch_session_raise(std::shared_ptr<launch_session_t> launch_session);
+  [[nodiscard]] bool launch_session_raise(std::shared_ptr<launch_session_t> launch_session);
+
+  /**
+   * @brief Check whether a launch request is waiting for its RTSP handshake.
+   * @return True when an earlier launch is still pending.
+   */
+  [[nodiscard]] bool launch_session_pending();
 
   /**
    * @brief Clear state for the specified launch session.

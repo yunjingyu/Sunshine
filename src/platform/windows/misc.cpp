@@ -9,6 +9,7 @@
 #include <iterator>
 #include <set>
 #include <sstream>
+#include <thread>
 #include <vector>
 
 // lib includes
@@ -43,6 +44,7 @@
 #include <Shlwapi.h>
 
 // local includes
+#include "display_preparation.h"
 #include "misc.h"
 #include "nvprefs/nvprefs_interface.h"
 #include "src/entry_handler.h"
@@ -122,6 +124,224 @@ namespace bp = boost::process::v1;
 using namespace std::literals;
 
 namespace platf {
+  namespace {
+    /**
+     * @brief Native operations used exclusively by a display configuration worker.
+     */
+    struct display_preparation_api_t {
+      using desktop_t = HDESK;
+
+      /**
+       * @brief Report a preparation failure without classifying it as a Windows lock.
+       */
+      void failure(const char *reason) const {
+        BOOST_LOG(error) << "Display preparation: " << reason;
+      }
+
+      /**
+       * @brief Report the exact Windows error from a failed preparation operation.
+       */
+      void native_failure(const char *operation, DWORD error_code) const {
+        BOOST_LOG(error) << "Display preparation: " << operation << " failed [" << error_code << ']';
+      }
+
+      /**
+       * @brief Reset the display idle timer once without changing any persistent power policy.
+       */
+      bool wake_display() const {
+        if (!SetThreadExecutionState(ES_DISPLAY_REQUIRED)) {
+          native_failure("SetThreadExecutionState", GetLastError());
+          return false;
+        }
+        return true;
+      }
+
+      /**
+       * @brief Read the calling process session's lock state without changing it.
+       */
+      display_preparation_e session_status() const {
+        DWORD session_id {};
+        if (!ProcessIdToSessionId(GetCurrentProcessId(), &session_id)) {
+          native_failure("ProcessIdToSessionId", GetLastError());
+          return display_preparation_e::failed;
+        }
+
+        LPWSTR buffer {};
+        DWORD bytes {};
+        if (!WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, session_id, WTSSessionInfoEx, &buffer, &bytes)) {
+          native_failure("WTSQuerySessionInformation(WTSSessionInfoEx)", GetLastError());
+          return display_preparation_e::failed;
+        }
+        const auto release = util::fail_guard([&]() {
+          WTSFreeMemory(buffer);
+        });
+        const auto info = reinterpret_cast<const WTSINFOEXW *>(buffer);
+        if (!info || bytes < sizeof(WTSINFOEXW) || info->Level != 1 || info->Data.WTSInfoExLevel1.SessionId != session_id) {
+          failure("Windows returned incomplete session lock information");
+          return display_preparation_e::failed;
+        }
+
+        const auto &session = info->Data.WTSInfoExLevel1;
+        if (session.SessionFlags == WTS_SESSIONSTATE_LOCK) {
+          return display_preparation_e::secure_desktop;
+        }
+        if (session.SessionFlags != WTS_SESSIONSTATE_UNLOCK || session.SessionState != WTSActive) {
+          failure("the process session is not positively identified as active and unlocked");
+          return display_preparation_e::failed;
+        }
+        return display_preparation_e::ready;
+      }
+
+      /**
+       * @brief Open the input desktop with only the rights used by preparation.
+       */
+      HDESK open_input_desktop() const {
+        const auto desktop = OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS | DESKTOP_WRITEOBJECTS | DESKTOP_ENUMERATE);
+        if (!desktop) {
+          native_failure("OpenInputDesktop", GetLastError());
+        }
+        return desktop;
+      }
+
+      /**
+       * @brief Identify the desktop before any attachment or screen saver messages.
+       */
+      detail::input_desktop_e desktop_kind(HDESK desktop) const {
+        WCHAR name[256] {};
+        DWORD needed {};
+        if (!GetUserObjectInformationW(desktop, UOI_NAME, name, sizeof(name), &needed)) {
+          native_failure("GetUserObjectInformation(UOI_NAME)", GetLastError());
+          return detail::input_desktop_e::unknown;
+        }
+        if (_wcsicmp(name, L"Default") == 0) {
+          return detail::input_desktop_e::normal;
+        }
+        if (_wcsicmp(name, L"Screen-saver") == 0) {
+          return detail::input_desktop_e::screen_saver;
+        }
+        if (_wcsicmp(name, L"Winlogon") == 0) {
+          return detail::input_desktop_e::secure;
+        }
+        return detail::input_desktop_e::unknown;
+      }
+
+      /**
+       * @brief Read whether dismissing the screen saver would require authentication.
+       */
+      std::optional<bool> screen_saver_secure() const {
+        BOOL secure {};
+        if (!SystemParametersInfoW(SPI_GETSCREENSAVESECURE, 0, &secure, 0)) {
+          native_failure("SystemParametersInfo(SPI_GETSCREENSAVESECURE)", GetLastError());
+          return std::nullopt;
+        }
+        return secure != FALSE;
+      }
+
+      /**
+       * @brief Confirm that a previously opened desktop still receives input.
+       */
+      std::optional<bool> is_input_desktop(HDESK desktop) const {
+        BOOL input {};
+        DWORD needed {};
+        if (!GetUserObjectInformationW(desktop, UOI_IO, &input, sizeof(input), &needed)) {
+          native_failure("GetUserObjectInformation(UOI_IO)", GetLastError());
+          return std::nullopt;
+        }
+        return input != FALSE;
+      }
+
+      /**
+       * @brief Request normal closure only for a verified nonsecure screen saver desktop.
+       */
+      display_preparation_e close_screen_saver(HDESK desktop) const {
+        const auto session = session_status();
+        if (session != display_preparation_e::ready) {
+          return session;
+        }
+        const auto secure = screen_saver_secure();
+        if (!secure) {
+          return display_preparation_e::failed;
+        }
+        if (*secure) {
+          return display_preparation_e::secure_desktop;
+        }
+        BOOL running {};
+        if (!SystemParametersInfoW(SPI_GETSCREENSAVERRUNNING, 0, &running, 0)) {
+          native_failure("SystemParametersInfo(SPI_GETSCREENSAVERRUNNING)", GetLastError());
+          return display_preparation_e::failed;
+        }
+        if (!running) {
+          return display_preparation_e::ready;
+        }
+
+        BOOST_LOG(info) << "Requesting closure of the nonsecure screen saver before display configuration.";
+        DWORD post_error {ERROR_SUCCESS};
+        SetLastError(ERROR_SUCCESS);
+        const auto enumerated = EnumDesktopWindows(desktop, [](HWND window, LPARAM context) -> BOOL {
+          if (!PostMessageW(window, WM_CLOSE, 0, 0)) {
+            const auto error = GetLastError();
+            // A screen saver window may disappear naturally during enumeration.
+            if (error != ERROR_INVALID_WINDOW_HANDLE) {
+              *reinterpret_cast<DWORD *>(context) = error;
+              return FALSE;
+            }
+          }
+          return TRUE;
+        },
+                                                   reinterpret_cast<LPARAM>(&post_error));
+        if (!enumerated || post_error != ERROR_SUCCESS) {
+          native_failure(post_error != ERROR_SUCCESS ? "PostMessage(WM_CLOSE)" : "EnumDesktopWindows", post_error != ERROR_SUCCESS ? post_error : GetLastError());
+          return display_preparation_e::failed;
+        }
+        return display_preparation_e::ready;
+      }
+
+      /**
+       * @brief Borrow the worker's original desktop; this handle must never be closed.
+       */
+      HDESK thread_desktop() const {
+        const auto desktop = GetThreadDesktop(GetCurrentThreadId());
+        if (!desktop) {
+          native_failure("GetThreadDesktop", GetLastError());
+        }
+        return desktop;
+      }
+
+      /**
+       * @brief Attach only the current worker; never switch the visible desktop.
+       */
+      bool set_thread_desktop(HDESK desktop) const {
+        if (!SetThreadDesktop(desktop)) {
+          native_failure("SetThreadDesktop", GetLastError());
+          return false;
+        }
+        return true;
+      }
+
+      /**
+       * @brief Release a desktop handle after its worker has detached.
+       */
+      void close_desktop(HDESK desktop) const {
+        if (!CloseDesktop(desktop)) {
+          native_failure("CloseDesktop", GetLastError());
+        }
+      }
+
+      /**
+       * @brief Allow a posted screen saver close request to finish without waiting indefinitely.
+       */
+      void wait_for_desktop() const {
+        std::this_thread::sleep_for(std::chrono::milliseconds {50});
+      }
+    };
+  }  // namespace
+
+  display_preparation_t prepare_display_configuration() {
+    // The operations have no mutable state and outlive every returned worker guard.
+    static display_preparation_api_t api;
+    return detail::prepare_display_configuration(api);
+  }
+
   /**
    * @brief Owning pointer for `GetAdaptersAddresses` results.
    */

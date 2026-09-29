@@ -108,6 +108,24 @@ TEST(DisplayDeviceRevertTest, EmptyEnumerationDoesNotSkipFirstAttempt) {
   EXPECT_TRUE(token.stopRequested());
 }
 
+TEST(DisplayDeviceRevertTest, NoSavedStateStopsWithoutReportingAnActualRestoration) {
+  RestoreSettings settings;
+  settings.results = {result_t::NoChangesToRevert};
+  result_t reported {result_t::Ok};
+  std::optional<std::chrono::milliseconds> delay;
+  auto callback {make_revert_callback(false, [&](auto result, auto next_retry) {
+    reported = result;
+    delay = next_retry;
+  })};
+  SchedulerStopToken token {[]() {
+  }};
+  callback(settings, token);
+  EXPECT_TRUE(token.stopRequested());
+  EXPECT_EQ(reported, result_t::NoChangesToRevert);
+  EXPECT_FALSE(delay);
+  EXPECT_EQ(settings.restore_calls, 1u);
+}
+
 TEST(DisplayDeviceRevertTest, UnchangedDevicesDoNotBlockRecoveryAfterTopologyFailure) {
   RestoreSettings settings;
   settings.devices = {{.m_device_id = "physical-monitor", .m_friendly_name = "Physical monitor"}};

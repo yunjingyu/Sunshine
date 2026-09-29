@@ -64,6 +64,23 @@ namespace safe {
       return val;
     }
 
+    /**
+     * @brief Atomically inspect and remove the current event only when its identity matches.
+     * @param predicate Called with the nonempty status as a const reference while the event is locked.
+     *                  It must not call other methods on this event.
+     * @return Removed event, or an empty result when stopped, empty, or rejected by the predicate.
+     */
+    template<class Predicate>
+    status_t try_pop_if(Predicate &&predicate) {
+      std::lock_guard lg {_lock};
+      if (!_continue || !_status || !std::forward<Predicate>(predicate)(std::as_const(_status))) {
+        return util::false_v<status_t>;
+      }
+      auto val = std::move(_status);
+      _status = util::false_v<status_t>;
+      return val;
+    }
+
     // pop and view should not be used interchangeably
     /**
      * @brief Remove and return the next queued item, waiting when requested.

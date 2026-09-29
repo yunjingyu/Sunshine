@@ -8,6 +8,7 @@
 // standard includes
 #include <algorithm>
 #include <cctype>
+#include <future>
 #include <mutex>
 #include <regex>
 #include <string_view>
@@ -22,12 +23,15 @@
 
 // local includes
 #include "audio.h"
+#include "display_device_apply.h"
 #include "display_device_revert.h"
 #include "platform/common.h"
 #include "rtsp.h"
 
 // platform-specific includes
 #ifdef _WIN32
+  #include "platform/windows/display_preparation.h"
+
   #include <display_device/windows/settings_manager.h>
   #include <display_device/windows/win_api_layer.h>
   #include <display_device/windows/win_display_device.h>
@@ -51,6 +55,7 @@ namespace display_device {
       std::mutex mutex {};
       std::chrono::milliseconds config_revert_delay {0};
       std::unique_ptr<RetryScheduler<SettingsManagerInterface>> sm_instance {nullptr};
+      std::optional<uint32_t> configuration_owner;  ///< Launch owning the current configuration or deferred attempt.
     } DD_DATA;
 
     /**
@@ -184,6 +189,8 @@ namespace display_device {
       switch (result) {
         case Ok:
           return "Ok";
+        case NoChangesToRevert:
+          return "NoChangesToRevert";
         case ApiTemporarilyUnavailable:
           return "ApiTemporarilyUnavailable";
         case TopologyIsInvalid:
@@ -732,6 +739,7 @@ namespace display_device {
      * @note This is function does not lock mutex.
      */
     void revert_configuration_unlocked(const revert_option_e option) {
+      DD_DATA.configuration_owner.reset();
       if (!DD_DATA.sm_instance) {
         // Platform is not supported, nothing to do.
         return;
@@ -743,6 +751,8 @@ namespace display_device {
         detail::make_revert_callback(option == revert_option_e::try_once, [](const auto result, const auto &next_retry) {
           if (result == SettingsManagerInterface::RevertResult::Ok) {
             BOOST_LOG(info) << "Display device configuration restore completed.";
+          } else if (result == SettingsManagerInterface::RevertResult::NoChangesToRevert) {
+            BOOST_LOG(info) << "No saved display device configuration to restore; no display changes were made.";
           } else if (next_retry) {
             BOOST_LOG(warning) << "Failed to restore display device configuration: " << revert_result_name(result)
                                << ". Will retry in " << next_retry->count() << " ms, even if the available devices are unchanged.";
@@ -838,53 +848,92 @@ namespace display_device {
     return mapped_name;
   }
 
-  void configure_display(const config::video_t &video_config, const rtsp_stream::launch_session_t &session) {
+  configuration_result_e configure_display(const config::video_t &video_config, const rtsp_stream::launch_session_t &session) {
     const auto result {parse_configuration(video_config, session)};
     if (const auto *parsed_config {std::get_if<SingleDisplayConfiguration>(&result)}; parsed_config) {
-      configure_display(*parsed_config);
-      return;
+      return configure_display(*parsed_config, session.id);
     }
 
     if (const auto *disabled {std::get_if<configuration_disabled_tag_t>(&result)}; disabled) {
       BOOST_LOG(info) << "Display device configuration is disabled. Reverting any active display device configuration.";
       revert_configuration();
-      return;
+      return configuration_result_e::ready;
     }
 
     BOOST_LOG(error) << "Failed to parse display device configuration. Display settings will not be changed.";
     // Error details should already be logged for failed_to_parse_tag_t case, and we also don't
     // want to revert active configuration in case we have any
+    return configuration_result_e::failed;
   }
 
-  void configure_display(const SingleDisplayConfiguration &config) {
+  configuration_result_e configure_display(const SingleDisplayConfiguration &config, uint32_t session_id) {
     std::lock_guard lock {DD_DATA.mutex};
     if (!DD_DATA.sm_instance) {
       // Platform is not supported, nothing to do.
-      return;
+      return configuration_result_e::ready;
     }
 
-    BOOST_LOG(info) << "Scheduling display device configuration:\n"
+    DD_DATA.configuration_owner = session_id;
+    BOOST_LOG(info) << "Preparing display device configuration:\n"
                     << toJson(config);
 
-    DD_DATA.sm_instance->schedule([config](auto &settings_iface, auto &stop_token) {
-      using enum SettingsManagerInterface::ApplyResult;
-
-      // We only want to keep retrying in case of a transient errors.
-      // In other cases, when we either fail or succeed we just want to stop...
-      const auto result {settings_iface.applySettings(config)};
-      if (result == Ok) {
-        BOOST_LOG(info) << "Display device configuration applied successfully.";
-      } else if (result == ApiTemporarilyUnavailable) {
-        BOOST_LOG(warning) << "Display device configuration API is temporarily unavailable. Will retry.";
-      } else {
-        BOOST_LOG(error) << "Display device configuration failed with result: " << apply_result_name(result);
-      }
-
-      if (result != ApiTemporarilyUnavailable) {
-        stop_token.requestStop();
-      }
+    auto attempt {detail::make_apply_attempt(config, []() {
+#ifdef _WIN32
+      return platf::prepare_display_configuration();
+#else
+      struct preparation_t {
+        configuration_result_e status {configuration_result_e::ready};
+      };
+      return preparation_t {};
+#endif
     },
-                                  {.m_sleep_durations = {DEFAULT_RETRY_INTERVAL}});
+                                             [](const auto result, const auto &applied) {
+                                               if (result == configuration_result_e::ready) {
+                                                 if (applied) {
+                                                   BOOST_LOG(info) << "Display device configuration applied successfully.";
+                                                 } else {
+                                                   BOOST_LOG(info) << "Requested display is active; no display setting changes were requested.";
+                                                 }
+                                               } else if (result == configuration_result_e::secure_desktop) {
+                                                 BOOST_LOG(info) << "Display configuration is waiting for the secure desktop to be unlocked. Remote login remains available.";
+                                               } else if (applied) {
+                                                 BOOST_LOG(error) << "Display device configuration failed with result: " << apply_result_name(*applied);
+                                               } else {
+                                                 BOOST_LOG(error) << "Display desktop preparation failed; capture must not start with stale display settings.";
+                                               }
+                                             })};
+
+    // Desktop attachment is local to a fresh worker, never the HTTP/UI thread.
+    // Waiting here makes encoder probing depend on the actual first outcome.
+    configuration_result_e result {configuration_result_e::failed};
+    DD_DATA.sm_instance->stop();
+    try {
+      result = std::async(std::launch::async, [&]() {
+                 return DD_DATA.sm_instance->execute([&](auto &settings_iface, auto &stop_token) {
+                   stop_token.requestStop();
+                   return attempt(settings_iface);
+                 });
+               }).get();
+    } catch (const std::exception &err) {
+      BOOST_LOG(error) << "Display configuration worker failed: " << err.what();
+    }
+    if (result == configuration_result_e::secure_desktop) {
+      DD_DATA.sm_instance->schedule([attempt](auto &settings_iface, auto &stop_token) {
+        if (attempt(settings_iface) != configuration_result_e::secure_desktop) {
+          stop_token.requestStop();
+        }
+      },
+                                    {.m_sleep_durations = {DEFAULT_RETRY_INTERVAL}, .m_execution = SchedulerOptions::Execution::ScheduledOnly});
+    }
+    return result;
+  }
+
+  void cancel_pending_configuration(uint32_t session_id) {
+    std::lock_guard lock {DD_DATA.mutex};
+    if (DD_DATA.configuration_owner && *DD_DATA.configuration_owner == session_id) {
+      BOOST_LOG(info) << "Cancelling display preparation for an expired streaming request.";
+      revert_configuration_unlocked(revert_option_e::try_indefinitely_with_delay);
+    }
   }
 
   void revert_configuration() {
@@ -894,6 +943,7 @@ namespace display_device {
 
   bool reset_persistence() {
     std::lock_guard lock {DD_DATA.mutex};
+    DD_DATA.configuration_owner.reset();
     if (!DD_DATA.sm_instance) {
       // Platform is not supported, assume success.
       return true;

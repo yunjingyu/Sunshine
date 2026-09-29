@@ -55,7 +55,7 @@ namespace display_device::detail {
     return [try_once, report = std::move(report), interval_index = std::size_t {0}](SettingsManagerInterface &settings_iface, SchedulerStopToken &stop_token) mutable {
       const auto result {settings_iface.revertSettings()};
       std::optional<std::chrono::milliseconds> next_retry;
-      if (try_once || result == SettingsManagerInterface::RevertResult::Ok) {
+      if (try_once || result == SettingsManagerInterface::RevertResult::Ok || result == SettingsManagerInterface::RevertResult::NoChangesToRevert) {
         stop_token.requestStop();
       } else {
         next_retry = revert_retry_intervals[interval_index];

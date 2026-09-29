@@ -1374,6 +1374,13 @@ namespace nvhttp {
       return;
     }
 
+    if (rtsp_stream::launch_session_pending()) {
+      tree.put("root.gamesession", 0);
+      tree.put("root.<xmlattr>.status_code", 503);
+      tree.put("root.<xmlattr>.status_message", "A stream connection is still pending. Retry after it connects or times out.");
+      return;
+    }
+
     host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
     auto launch_session = make_launch_session(host_audio, args);
 
@@ -1384,7 +1391,12 @@ namespace nvhttp {
       // We want to prepare display only if there are no active sessions at
       // the moment. This should be done before probing encoders as it could
       // change the active displays.
-      display_device::configure_display(config::video, *launch_session);
+      if (display_device::configure_display(config::video, *launch_session) == display_device::configuration_result_e::failed) {
+        tree.put("root.<xmlattr>.status_code", 503);
+        tree.put("root.<xmlattr>.status_message", "Failed to prepare the requested display. Check Sunshine's display configuration diagnostics.");
+        tree.put("root.gamesession", 0);
+        return;
+      }
 
       // Probe encoders again before streaming to ensure our chosen
       // encoder matches the active GPU (which could have changed
@@ -1433,7 +1445,12 @@ namespace nvhttp {
     );
     tree.put("root.gamesession", 1);
 
-    rtsp_stream::launch_session_raise(launch_session);
+    if (!rtsp_stream::launch_session_raise(launch_session)) {
+      tree.put("root.gamesession", 0);
+      tree.put("root.<xmlattr>.status_code", 503);
+      tree.put("root.<xmlattr>.status_message", "Another stream connection is already pending.");
+      return;
+    }
 
     // Stream was started successfully, we will revert the config when the app or session terminates
     revert_display_configuration = false;
@@ -1450,6 +1467,7 @@ namespace nvhttp {
     print_req<SunshineHTTPS>(request);
 
     pt::ptree tree;
+    bool revert_display_configuration {false};
     auto g = util::fail_guard([&]() {
       std::ostringstream data;
 
@@ -1460,6 +1478,9 @@ namespace nvhttp {
       pt::write_xml(data, tree);
       response->write(data.str());
       response->close_connection_after_response = true;
+      if (revert_display_configuration) {
+        display_device::revert_configuration();
+      }
     });
 
     auto current_appid = proc::proc.running();
@@ -1483,6 +1504,13 @@ namespace nvhttp {
       return;
     }
 
+    if (rtsp_stream::launch_session_pending()) {
+      tree.put("root.resume", 0);
+      tree.put("root.<xmlattr>.status_code", 503);
+      tree.put("root.<xmlattr>.status_message", "A stream connection is still pending. Retry after it connects or times out.");
+      return;
+    }
+
     // Newer Moonlight clients send localAudioPlayMode on /resume too,
     // so we should use it if it's present in the args and there are
     // no active sessions we could be interfering with.
@@ -1493,10 +1521,16 @@ namespace nvhttp {
     const auto launch_session = make_launch_session(host_audio, args);
 
     if (no_active_sessions) {
+      revert_display_configuration = true;
       // We want to prepare display only if there are no active sessions at
       // the moment. This should be done before probing encoders as it could
       // change the active displays.
-      display_device::configure_display(config::video, *launch_session);
+      if (display_device::configure_display(config::video, *launch_session) == display_device::configuration_result_e::failed) {
+        tree.put("root.resume", 0);
+        tree.put("root.<xmlattr>.status_code", 503);
+        tree.put("root.<xmlattr>.status_message", "Failed to prepare the requested display. Check Sunshine's display configuration diagnostics.");
+        return;
+      }
 
       // Probe encoders again before streaming to ensure our chosen
       // encoder matches the active GPU (which could have changed
@@ -1534,7 +1568,13 @@ namespace nvhttp {
     );
     tree.put("root.resume", 1);
 
-    rtsp_stream::launch_session_raise(launch_session);
+    if (!rtsp_stream::launch_session_raise(launch_session)) {
+      tree.put("root.resume", 0);
+      tree.put("root.<xmlattr>.status_code", 503);
+      tree.put("root.<xmlattr>.status_message", "Another stream connection is already pending.");
+      return;
+    }
+    revert_display_configuration = false;
   }
 
   /**

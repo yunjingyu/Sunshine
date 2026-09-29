@@ -6,6 +6,7 @@
 
 // standard includes
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -28,6 +29,14 @@ namespace rtsp_stream {
 }
 
 namespace display_device {
+  /**
+   * @brief Outcome of preparing the requested display before starting capture.
+   */
+  enum class configuration_result_e {
+    ready,  ///< Configuration is ready, disabled, or unsupported on this platform.
+    secure_desktop,  ///< A verified secure desktop needs the user's remote login before configuration.
+    failed  ///< Configuration failed; starting capture would use an unintended display configuration.
+  };
   /**
    * @brief Initialize the implementation and perform the initial state recovery (if needed).
    * @param persistence_filepath File location for reading/saving persistent state.
@@ -74,6 +83,7 @@ namespace display_device {
    *
    * @param video_config User's video related configuration.
    * @param session Session information.
+   * @return Ready, explicitly deferred for remote login, or failed.
    *
    * @examples
    * const std::shared_ptr<rtsp_stream::launch_session_t> launch_session;
@@ -82,27 +92,31 @@ namespace display_device {
    * configure_display(video_config, *launch_session);
    * @examples_end
    */
-  void configure_display(const config::video_t &video_config, const rtsp_stream::launch_session_t &session);
+  [[nodiscard]] configuration_result_e configure_display(const config::video_t &video_config, const rtsp_stream::launch_session_t &session);
 
   /**
    * @brief Configure the display device using the provided configuration.
    *
-   * In some cases configuring display can fail due to transient issues and
-   * we will keep trying every 5 seconds, even if the stream has already started as there was
-   * no possibility to apply settings before the stream start.
-   *
-   * Therefore, there is no return value as we still want to continue with the stream, so that
-   * the users can do something about it once they are connected. Otherwise, we might
-   * prevent users from logging in at all if we keep failing to apply configuration.
+   * Preparation and the first application finish before this call returns. Only a
+   * positively identified secure desktop may defer configuration until the user
+   * logs in remotely; ordinary failures must not start capture with stale settings.
    *
    * @param config Configuration for the display.
+   * @param session_id Launch request owning any deferred configuration.
+   * @return Ready, explicitly deferred for remote login, or failed.
    *
    * @examples
    * const SingleDisplayConfiguration valid_config { };
    * configure_display(valid_config);
    * @examples_end
    */
-  void configure_display(const SingleDisplayConfiguration &config);
+  [[nodiscard]] configuration_result_e configure_display(const SingleDisplayConfiguration &config, uint32_t session_id = 0);
+
+  /**
+   * @brief Cancel and restore a configuration whose owning RTSP launch expired.
+   * @param session_id Expired launch request; newer requests are left untouched.
+   */
+  void cancel_pending_configuration(uint32_t session_id);
 
   /**
    * @brief Revert the display configuration and restore the previous state.

@@ -16,7 +16,17 @@ The Windows display library also switched directly from the streaming topology t
 * On failure, retain the recovery record and restore the last verified topology. Preserve clone groups rather than guessing an all-extended desktop.
 * Permit the lower Windows API path to reconstruct a requested topology from available paths when the current topology is empty. Require a successful readback; API return status alone is insufficient.
 
-Only the restoration caller uses the additional preservation mode when restoring modified settings. Normal configuration application keeps its existing behavior.
+Only the restoration caller uses the additional preservation mode when restoring modified settings. The library's normal topology application keeps its existing behavior.
+
+## Screen saver preparation and accurate outcomes (displayfix2)
+
+A later remote connection failed before display configuration: Windows was using the `Screen-saver` input desktop and the availability check failed. The old launch path continued capturing the unchanged 800x600 VDD. This is distinct from a failed restoration after a stream. A read-only validation probe returned access denied; the original Sunshine log did not retain its native error code.
+
+Windows now performs initial preparation and configuration on a fresh worker and waits for its result before encoder probing. Preparation resets the display idle timer, verifies the session and input desktop, and requests normal closure of a confirmed nonsecure screen saver. It observes the desktop transition with at most 30 polling waits of 50 milliseconds each; native API query time is additional. A scoped attachment changes only the worker's desktop and is restored on that worker after configuration. It does not change screen saver settings, unlock Windows, switch the visible desktop, or terminate a screen saver process.
+
+A positively identified locked session or secure desktop retains the existing remote login path, with configuration explicitly deferred and retried after the user unlocks it. Unknown preparation errors and display-configuration failures return an actionable launch/resume error instead of starting capture with stale settings. Verify-only requests without resolution, refresh-rate, or HDR changes read the requested display's active state without invoking configuration. Failed resumes clean up their preparation just like failed launches. Overlapping pending stream requests are rejected before preparing another display configuration. Expired RTSP requests cancel only their own pending configuration; a newer request is not cancelled by an older timeout.
+
+Native availability failures now record the original Windows error code and message. `NoChangesToRevert` distinguishes an absent recovery record from an actual completed restoration, and is a terminal scheduler result. A no-op is logged as no saved configuration and no display changes, never as restoration completed.
 
 ## Reapplying to another release
 

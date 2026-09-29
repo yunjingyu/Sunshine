@@ -23,6 +23,7 @@ extern "C" {
 
 // local includes
 #include "config.h"
+#include "display_device.h"
 #include "globals.h"
 #include "input.h"
 #include "logging.h"
@@ -589,28 +590,39 @@ namespace rtsp_stream {
     /**
      * @brief Launch a new streaming session.
      * @note If the client does not begin streaming within the ping_timeout,
-     *       the session will be discarded.
+     *       the session will be discarded and its pending display configuration
+     *       cancelled when no streaming session is active.
      * @param launch_session Streaming session information.
+     * @return True if accepted, or false when an earlier launch is still pending.
      */
-    void session_raise(std::shared_ptr<launch_session_t> launch_session) {
+    bool session_raise(std::shared_ptr<launch_session_t> launch_session) {
       // If a launch event is still pending, don't overwrite it.
       if (launch_event.view(0s)) {
-        return;
+        return false;
       }
 
       // Raise the new launch session to prepare for the RTSP handshake
+      const auto launch_session_id = launch_session->id;
       launch_event.raise(std::move(launch_session));
 
       // Arm the timer to expire this launch session if the client times out
       raised_timer.expires_after(config::stream.ping_timeout);
-      raised_timer.async_wait([this](const boost::system::error_code &ec) {
+      raised_timer.async_wait([this, launch_session_id](const boost::system::error_code &ec) {
         if (!ec) {
-          auto discarded = launch_event.pop(0s);
+          // Cancellation cannot retract an expiry callback already queued by Asio.
+          // Check and consume its own launch atomically, leaving any newer launch intact.
+          auto discarded = launch_event.try_pop_if([launch_session_id](const auto &pending) {
+            return pending->id == launch_session_id;
+          });
           if (discarded) {
             BOOST_LOG(debug) << "Event timeout: "sv << discarded->unique_id;
+            if (session_count() == 0) {
+              display_device::cancel_pending_configuration(discarded->id);
+            }
           }
         }
       });
+      return true;
     }
 
     /**
@@ -618,17 +630,12 @@ namespace rtsp_stream {
      * @param launch_session_id The ID of the session to clear.
      */
     void session_clear(uint32_t launch_session_id) {
-      // We currently only support a single pending RTSP session,
-      // so the ID should always match the one for that session.
-      auto launch_session = launch_event.view(0s);
-      if (launch_session) {
-        if (launch_session->id != launch_session_id) {
-          BOOST_LOG(error) << "Attempted to clear unexpected session: "sv << launch_session_id << " vs "sv << launch_session->id;
-        } else {
-          raised_timer.cancel();
-          launch_event.pop();
-        }
-      }
+      // An old control connection must not clear a replacement launch. Leave the
+      // timer alone: its identity-checked handler is harmless after consumption,
+      // and cancelling here could race with the next launch arming a new timer.
+      launch_event.try_pop_if([launch_session_id](const auto &pending) {
+        return pending->id == launch_session_id;
+      });
     }
 
     /**
@@ -741,9 +748,19 @@ namespace rtsp_stream {
 
   /**
    * @brief Queue a launch session until the RTSP client connects.
+   * @param launch_session Session prepared by the GameStream launch handler.
+   * @return True if accepted, or false when an earlier launch is still pending.
    */
-  void launch_session_raise(std::shared_ptr<launch_session_t> launch_session) {
-    server.session_raise(std::move(launch_session));
+  bool launch_session_raise(std::shared_ptr<launch_session_t> launch_session) {
+    return server.session_raise(std::move(launch_session));
+  }
+
+  /**
+   * @brief Check whether a launch request is waiting for its RTSP handshake.
+   * @return True when an earlier launch is still pending.
+   */
+  bool launch_session_pending() {
+    return static_cast<bool>(server.launch_event.view(0s));
   }
 
   void launch_session_clear(uint32_t launch_session_id) {
