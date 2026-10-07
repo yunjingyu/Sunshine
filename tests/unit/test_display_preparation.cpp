@@ -36,6 +36,34 @@ namespace {
     bool restore_ok {true};
     unsigned int waits {};
     unsigned int closes {};
+    unsigned int suspensions {};
+    unsigned int start_requests {};
+    bool suspend_ok {true};
+    bool start_ok {true};
+    std::deque<std::optional<bool>> running_results;
+    std::optional<bool> running {false};
+
+    /** @brief Record suspension of the normal screen saver for an active stream. */
+    bool suspend_nonsecure_screen_saver() {
+      ++suspensions;
+      return suspend_ok;
+    }
+
+    /** @brief Inject the observed native running state, including query failures. */
+    std::optional<bool> screen_saver_running() {
+      if (running_results.empty()) {
+        return running;
+      }
+      const auto value = running_results.front();
+      running_results.pop_front();
+      return value;
+    }
+
+    /** @brief Record the normal Windows start request without touching a live desktop. */
+    bool request_screen_saver() {
+      ++start_requests;
+      return start_ok;
+    }
 
     /**
      * @brief Record a one-shot display wake request.
@@ -292,5 +320,84 @@ namespace {
     api.wake_ok = false;
     EXPECT_EQ(platf::detail::prepare_display_configuration(api).status, display_preparation_e::failed);
     EXPECT_EQ(api.calls, (std::vector<std::string> {"wake"}));
+  }
+
+  TEST(DisplayPreparationTest, NormalDesktopSuspendsSaverBeforeConfiguration) {
+    desktop_api_t api;
+    auto prepared = platf::detail::prepare_display_configuration(api);
+    EXPECT_EQ(prepared.status, display_preparation_e::ready);
+    EXPECT_EQ(api.suspensions, 1u);
+  }
+
+  TEST(DisplayPreparationTest, SuspensionFailureCannotStartCaptureWithAnActiveSaver) {
+    desktop_api_t api;
+    api.suspend_ok = false;
+    auto prepared = platf::detail::prepare_display_configuration(api);
+    EXPECT_EQ(prepared.status, display_preparation_e::failed);
+    EXPECT_EQ(prepared.guard, nullptr);
+    EXPECT_EQ(api.calls.back(), "close:20");
+  }
+
+  TEST(ScreenSaverStartTest, NormalDesktopRequestsAndObservesActualStartup) {
+    desktop_api_t api;
+    api.running_results = {false, false, true};
+    EXPECT_TRUE(platf::detail::start_screen_saver(api));
+    EXPECT_EQ(api.start_requests, 1u);
+    EXPECT_EQ(api.waits, 1u);
+    EXPECT_EQ(api.suspensions, 0u);
+    EXPECT_EQ(api.calls.back(), "close:20");
+  }
+
+  TEST(ScreenSaverStartTest, RequestSuccessWithoutRunningReadbackIsFailure) {
+    desktop_api_t api;
+    EXPECT_FALSE(platf::detail::start_screen_saver(api));
+    EXPECT_EQ(api.start_requests, 1u);
+    EXPECT_EQ(api.waits, 30u);
+  }
+
+  TEST(ScreenSaverStartTest, AlreadyRunningSaverDoesNotRestart) {
+    desktop_api_t api;
+    api.running = true;
+    EXPECT_TRUE(platf::detail::start_screen_saver(api));
+    EXPECT_EQ(api.start_requests, 0u);
+  }
+
+  TEST(ScreenSaverStartTest, LockedSessionIsProtectedWithoutOpeningOrUnlocking) {
+    desktop_api_t api;
+    api.sessions = {display_preparation_e::secure_desktop};
+    EXPECT_TRUE(platf::detail::start_screen_saver(api));
+    EXPECT_TRUE(api.calls.empty());
+    EXPECT_EQ(api.start_requests, 0u);
+  }
+
+  TEST(ScreenSaverStartTest, ExistingSaverDesktopIsNotAttachedOrClosed) {
+    desktop_api_t api;
+    api.desktops = {input_desktop_e::screen_saver};
+    EXPECT_TRUE(platf::detail::start_screen_saver(api));
+    EXPECT_EQ(api.closes, 0u);
+    EXPECT_EQ(api.calls, (std::vector<std::string> {"open", "close:20"}));
+  }
+
+  TEST(ScreenSaverStartTest, UnknownDesktopCannotReceiveStartCommand) {
+    desktop_api_t api;
+    api.desktops = {input_desktop_e::unknown};
+    EXPECT_FALSE(platf::detail::start_screen_saver(api));
+    EXPECT_EQ(api.start_requests, 0u);
+  }
+
+  TEST(ScreenSaverStartTest, DesktopSwitchBeforeRequestCannotStartOnStaleDesktop) {
+    desktop_api_t api;
+    api.input_results = {false};
+    EXPECT_FALSE(platf::detail::start_screen_saver(api));
+    EXPECT_EQ(api.start_requests, 0u);
+  }
+
+  TEST(ScreenSaverStartTest, NativeStartAndQueryFailuresRemainFailures) {
+    desktop_api_t api;
+    api.start_ok = false;
+    EXPECT_FALSE(platf::detail::start_screen_saver(api));
+    api.start_ok = true;
+    api.running = std::nullopt;
+    EXPECT_FALSE(platf::detail::start_screen_saver(api));
   }
 }  // namespace

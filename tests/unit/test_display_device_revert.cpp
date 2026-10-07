@@ -278,3 +278,41 @@ TEST(DisplayDeviceRevertTest, FailedShutdownAttemptCancelsEarlierRestoreSchedule
     EXPECT_FALSE(scheduler.isScheduled());
   });
 }
+
+TEST(DisplayDeviceRevertTest, ScreenSaverStartsOnlyAfterRestoreSucceeds) {
+  RestoreSettings settings;
+  settings.results = {result_t::SwitchingTopologyFailed, result_t::Ok};
+  unsigned int starts {};
+  auto callback = make_revert_callback(false, ignore_report, [&]() {
+    ++starts;
+    return true;
+  });
+  SchedulerStopToken first {[]() {
+  }};
+  callback(settings, first);
+  EXPECT_EQ(starts, 0u);
+  EXPECT_FALSE(first.stopRequested());
+  SchedulerStopToken second {[]() {
+  }};
+  callback(settings, second);
+  EXPECT_EQ(starts, 1u);
+  EXPECT_TRUE(second.stopRequested());
+}
+
+TEST(DisplayDeviceRevertTest, UnverifiedScreenSaverStartIsRetriedWithoutFalseCompletion) {
+  RestoreSettings settings;
+  settings.results = {result_t::NoChangesToRevert, result_t::NoChangesToRevert};
+  unsigned int starts {};
+  auto callback = make_revert_callback(false, ignore_report, [&]() {
+    return ++starts == 2;
+  });
+  SchedulerStopToken first {[]() {
+  }};
+  callback(settings, first);
+  EXPECT_FALSE(first.stopRequested());
+  SchedulerStopToken second {[]() {
+  }};
+  callback(settings, second);
+  EXPECT_TRUE(second.stopRequested());
+  EXPECT_EQ(starts, 2u);
+}

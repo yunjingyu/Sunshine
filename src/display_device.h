@@ -118,17 +118,28 @@ namespace display_device {
    */
   void cancel_pending_configuration(uint32_t session_id);
 
+  /** @brief Get the display generation shared by streams using the current configuration. */
+  [[nodiscard]] uint64_t configuration_generation();
+
+  /**
+   * @brief Finish the last stream, optionally restore displays, then start the Windows screen saver.
+   * @param generation Ending stream generation; an older stream cannot disturb a newer connection.
+   * @param restore_display Whether existing disconnect settings require display restoration.
+   */
+  void finish_stream(uint64_t generation, bool restore_display);
+
   /**
    * @brief Revert the display configuration and restore the previous state.
    *
    * In case the state could not be restored, by default it will be retried again in 5 seconds
    * (repeating indefinitely until success or until persistence is reset).
+   * @param start_screen_saver Also resume the idle screen saver after an unsuccessful launch or explicit client cancellation.
    *
    * @examples
    * revert_configuration();
    * @examples_end
    */
-  void revert_configuration();
+  void revert_configuration(bool start_screen_saver = false);
 
   /**
    * @brief Reset persisted display state and the captured initial state.

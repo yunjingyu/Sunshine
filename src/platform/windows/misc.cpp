@@ -237,6 +237,49 @@ namespace platf {
         return secure != FALSE;
       }
 
+      /** @brief Read whether Windows has actually started a screen saver. */
+      std::optional<bool> screen_saver_running() const {
+        BOOL running {};
+        if (!SystemParametersInfoW(SPI_GETSCREENSAVERRUNNING, 0, &running, 0)) {
+          native_failure("SystemParametersInfo(SPI_GETSCREENSAVERRUNNING)", GetLastError());
+          return std::nullopt;
+        }
+        return running != FALSE;
+      }
+
+      /** @brief Suspend only a nonsecure saver during streaming, without persisting a policy change. */
+      bool suspend_nonsecure_screen_saver() const {
+        const auto secure = screen_saver_secure();
+        if (!secure) {
+          return false;
+        }
+        if (*secure) {
+          return true;
+        }
+        if (!SystemParametersInfoW(SPI_SETSCREENSAVEACTIVE, FALSE, nullptr, 0)) {
+          native_failure("SystemParametersInfo(SPI_SETSCREENSAVEACTIVE, FALSE)", GetLastError());
+          return false;
+        }
+        BOOST_LOG(info) << "Nonsecure screen saver suspended for streaming; password and timeout settings preserved.";
+        return true;
+      }
+
+      /** @brief Enable the configured saver in this Windows session and request its normal startup. */
+      bool request_screen_saver() const {
+        if (!SystemParametersInfoW(SPI_SETSCREENSAVEACTIVE, TRUE, nullptr, 0)) {
+          native_failure("SystemParametersInfo(SPI_SETSCREENSAVEACTIVE, TRUE)", GetLastError());
+          return false;
+        }
+        const auto window = GetDesktopWindow();
+        DWORD_PTR result {};
+        if (!window || !SendMessageTimeoutW(window, WM_SYSCOMMAND, SC_SCREENSAVE, 0, SMTO_ABORTIFHUNG | SMTO_BLOCK, 1000, &result)) {
+          native_failure("SendMessageTimeout(SC_SCREENSAVE)", GetLastError());
+          return false;
+        }
+        BOOST_LOG(info) << "Requested configured screen saver after the last stream and display restoration.";
+        return true;
+      }
+
       /**
        * @brief Confirm that a previously opened desktop still receives input.
        */
@@ -340,6 +383,15 @@ namespace platf {
     // The operations have no mutable state and outlive every returned worker guard.
     static display_preparation_api_t api;
     return detail::prepare_display_configuration(api);
+  }
+
+  bool start_screen_saver() {
+    static display_preparation_api_t api;
+    const bool started {detail::start_screen_saver(api)};
+    if (started) {
+      BOOST_LOG(info) << "Idle desktop protection verified: screen saver active or Windows already locked.";
+    }
+    return started;
   }
 
   /**

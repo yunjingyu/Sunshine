@@ -46,6 +46,13 @@ namespace platf {
    */
   [[nodiscard]] display_preparation_t prepare_display_configuration();
 
+  /**
+   * @brief Start the configured Windows screen saver and verify that it becomes active.
+   * @return True if the saver is active or Windows is already securely locked.
+   * @note Call after the last stream stops and display restoration succeeds; never unlocks Windows.
+   */
+  [[nodiscard]] bool start_screen_saver();
+
   namespace detail {
     /**
      * @brief Recognized input desktop types; other desktops must not be modified.
@@ -104,6 +111,63 @@ namespace platf {
     };
 
     /**
+     * @brief Start the screen saver only on a verified normal input desktop.
+     * @param api Native operations that outlive the scoped worker attachment.
+     * @return Whether Windows is protected by an active saver or an existing secure desktop.
+     */
+    template<class Api>
+    bool start_screen_saver(Api &api) {
+      const auto session = api.session_status();
+      if (session == display_preparation_e::secure_desktop) {
+        return true;
+      }
+      if (session != display_preparation_e::ready) {
+        return false;
+      }
+      const auto desktop = api.open_input_desktop();
+      if (!desktop) {
+        return false;
+      }
+      auto guard = std::make_unique<display_desktop_guard_t<Api>>(api, desktop);
+      const auto kind = api.desktop_kind(desktop);
+      if (kind == input_desktop_e::secure || kind == input_desktop_e::screen_saver) {
+        return true;
+      }
+      if (kind != input_desktop_e::normal || !guard->attach()) {
+        api.failure("cannot start screen saver on an unverified input desktop");
+        return false;
+      }
+      const auto input = api.is_input_desktop(desktop);
+      if (!input || !*input || api.session_status() != display_preparation_e::ready) {
+        return false;
+      }
+      auto running = api.screen_saver_running();
+      if (!running) {
+        return false;
+      }
+      if (*running) {
+        return true;
+      }
+      if (!api.request_screen_saver()) {
+        return false;
+      }
+      for (unsigned int attempt = 0; attempt <= 30; ++attempt) {
+        running = api.screen_saver_running();
+        if (!running) {
+          return false;
+        }
+        if (*running || api.session_status() == display_preparation_e::secure_desktop) {
+          return true;
+        }
+        if (attempt < 30) {
+          api.wait_for_desktop();
+        }
+      }
+      api.failure("screen saver did not become active after SC_SCREENSAVE; retaining the idle request for retry");
+      return false;
+    }
+
+    /**
      * @brief Run the production preparation policy with injectable native operations.
      * @param api Operations that must outlive the returned guard.
      * @return A scoped, verified attachment or a reason not to configure displays.
@@ -116,7 +180,7 @@ namespace platf {
 
       bool close_requested {false};
       // PostMessage never waits for a screen saver. Observe its desktop transition
-      // for at most 30 short waits, without disabling the user's screen saver.
+      // for at most 30 short waits before suspending its nonsecure idle timer.
       for (unsigned int attempt = 0; attempt <= 30; ++attempt) {
         const auto session = api.session_status();
         if (session != display_preparation_e::ready) {
@@ -147,6 +211,9 @@ namespace platf {
             return {};
           }
           if (*input) {
+            if (!api.suspend_nonsecure_screen_saver()) {
+              return {};
+            }
             return {display_preparation_e::ready, std::move(guard)};
           }
           // The input desktop changed while the worker was attaching. Re-query

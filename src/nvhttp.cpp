@@ -1345,7 +1345,7 @@ namespace nvhttp {
       response->close_connection_after_response = true;
 
       if (revert_display_configuration) {
-        display_device::revert_configuration();
+        display_device::revert_configuration(true);
       }
     });
 
@@ -1479,7 +1479,7 @@ namespace nvhttp {
       response->write(data.str());
       response->close_connection_after_response = true;
       if (revert_display_configuration) {
-        display_device::revert_configuration();
+        display_device::revert_configuration(true);
       }
     });
 
@@ -1605,7 +1605,7 @@ namespace nvhttp {
     }
 
     // The config needs to be reverted regardless of whether "proc::proc.terminate()" was called or not.
-    display_device::revert_configuration();
+    display_device::revert_configuration(true);
   }
 
   /**

@@ -551,6 +551,7 @@ namespace stream {
     } control;  ///< Runtime state for the encrypted GameStream control channel.
 
     std::uint32_t launch_session_id;  ///< RTSP launch-session ID associated with this stream.
+    uint64_t display_generation;  ///< Display configuration shared by this group of connected clients.
     std::string client_cert;  ///< PEM certificate for the paired client owning the stream.
     std::string input_session_id;  ///< Stable client identity used to retain input devices across resume.
 
@@ -2249,11 +2250,8 @@ namespace stream {
           input::terminate_gamepads();
         }
 
-        if (revert_display_config) {
-          display_device::revert_configuration();
-        }
-
         platf::streaming_will_stop();
+        display_device::finish_stream(session.display_generation, revert_display_config);
       }
 
       BOOST_LOG(debug) << "Session ended"sv;
@@ -2314,6 +2312,7 @@ namespace stream {
 
       session->shutdown_event = mail->event<bool>(mail::shutdown);
       session->launch_session_id = launch_session.id;
+      session->display_generation = display_device::configuration_generation();
       session->client_cert = launch_session.client_cert;
       session->input_session_id = launch_session.client_cert.empty() ? launch_session.unique_id : launch_session.client_cert;
 

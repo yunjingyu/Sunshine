@@ -46,16 +46,19 @@ namespace display_device::detail {
   /**
    * @brief Create the callback used by the restore scheduler.
    * @tparam ReportT Callable accepting the actual restore result and optional delay before the next attempt.
+   * @tparam CompleteT Callable verifying the requested post-restoration idle action.
    * @param try_once Stop after one attempt, including failures, for shutdown and reinitialization.
    * @param report Reports each attempted restore; an empty delay means no further attempts are scheduled.
-   * @return Stateful callback that stops on success and retries failures independently of device enumeration.
+   * @param complete Called only after successful restoration; false retains the schedule for idle-action retries.
+   * @return Callback that stops after restoration and idle completion, retrying either failure.
    */
-  template<class ReportT>
-  auto make_revert_callback(bool try_once, ReportT report) {
-    return [try_once, report = std::move(report), interval_index = std::size_t {0}](SettingsManagerInterface &settings_iface, SchedulerStopToken &stop_token) mutable {
+  template<class ReportT, class CompleteT>
+  auto make_revert_callback(bool try_once, ReportT report, CompleteT complete) {
+    return [try_once, report = std::move(report), complete = std::move(complete), interval_index = std::size_t {0}](SettingsManagerInterface &settings_iface, SchedulerStopToken &stop_token) mutable {
       const auto result {settings_iface.revertSettings()};
       std::optional<std::chrono::milliseconds> next_retry;
-      if (try_once || result == SettingsManagerInterface::RevertResult::Ok || result == SettingsManagerInterface::RevertResult::NoChangesToRevert) {
+      const bool restored {result == SettingsManagerInterface::RevertResult::Ok || result == SettingsManagerInterface::RevertResult::NoChangesToRevert};
+      if (try_once || (restored && complete())) {
         stop_token.requestStop();
       } else {
         next_retry = revert_retry_intervals[interval_index];
@@ -65,5 +68,18 @@ namespace display_device::detail {
       }
       report(result, next_retry);
     };
+  }
+
+  /**
+   * @brief Restore without an additional idle action, preserving the ordinary retry policy.
+   * @param try_once Stop after one attempt.
+   * @param report Reports the actual restore result and next delay.
+   * @return Production restore callback with no additional completion requirement.
+   */
+  template<class ReportT>
+  auto make_revert_callback(bool try_once, ReportT report) {
+    return make_revert_callback(try_once, std::move(report), []() {
+      return true;
+    });
   }
 }  // namespace display_device::detail

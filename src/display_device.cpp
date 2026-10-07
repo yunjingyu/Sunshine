@@ -24,6 +24,7 @@
 // local includes
 #include "audio.h"
 #include "display_device_apply.h"
+#include "display_device_idle.h"
 #include "display_device_revert.h"
 #include "platform/common.h"
 #include "rtsp.h"
@@ -56,6 +57,7 @@ namespace display_device {
       std::chrono::milliseconds config_revert_delay {0};
       std::unique_ptr<RetryScheduler<SettingsManagerInterface>> sm_instance {nullptr};
       std::optional<uint32_t> configuration_owner;  ///< Launch owning the current configuration or deferred attempt.
+      detail::idle_screen_saver_t idle_saver;  ///< Last-disconnect completion belonging to the current display generation.
     } DD_DATA;
 
     /**
@@ -760,7 +762,16 @@ namespace display_device {
             BOOST_LOG(warning) << "Final display device configuration restore attempt failed: " << revert_result_name(result)
                                << ". Recovery will be retried at the next startup if persisted state remains.";
           }
-        }),
+        },
+                                     []() {
+#ifdef _WIN32
+                                       return DD_DATA.idle_saver.complete([]() {
+                                         return platf::start_screen_saver();
+                                       });
+#else
+                                       return true;
+#endif
+                                     }),
         scheduler_options
       );
     }
@@ -768,6 +779,7 @@ namespace display_device {
 
   std::unique_ptr<platf::deinit_t> init(const std::filesystem::path &persistence_filepath, const config::video_t &video_config) {
     std::lock_guard lock {DD_DATA.mutex};
+    DD_DATA.idle_saver.cancel();
     // We can support re-init without any issues, however we should make sure to clean up first!
     revert_configuration_unlocked(revert_option_e::try_once);
     DD_DATA.config_revert_delay = video_config.dd.config_revert_delay;
@@ -793,6 +805,7 @@ namespace display_device {
     public:
       ~deinit_t() override {
         std::lock_guard lock {DD_DATA.mutex};
+        DD_DATA.idle_saver.cancel();
         try {
           // This may throw if used incorrectly. At the moment this will not happen, however
           // in case some unforeseen changes are made that could raise an exception,
@@ -855,9 +868,27 @@ namespace display_device {
     }
 
     if (const auto *disabled {std::get_if<configuration_disabled_tag_t>(&result)}; disabled) {
+      std::lock_guard lock {DD_DATA.mutex};
+      DD_DATA.idle_saver.begin_connection();
       BOOST_LOG(info) << "Display device configuration is disabled. Reverting any active display device configuration.";
-      revert_configuration();
+      revert_configuration_unlocked(revert_option_e::try_indefinitely_with_delay);
+      DD_DATA.configuration_owner = session.id;
+#ifdef _WIN32
+      try {
+        return std::async(std::launch::async, []() {
+                 const auto context {platf::prepare_display_configuration()};
+                 return context.status == platf::display_preparation_e::ready          ? configuration_result_e::ready :
+                        context.status == platf::display_preparation_e::secure_desktop ? configuration_result_e::secure_desktop :
+                                                                                         configuration_result_e::failed;
+               })
+          .get();
+      } catch (const std::exception &err) {
+        BOOST_LOG(error) << "Display preparation worker failed: " << err.what();
+        return configuration_result_e::failed;
+      }
+#else
       return configuration_result_e::ready;
+#endif
     }
 
     BOOST_LOG(error) << "Failed to parse display device configuration. Display settings will not be changed.";
@@ -868,6 +899,7 @@ namespace display_device {
 
   configuration_result_e configure_display(const SingleDisplayConfiguration &config, uint32_t session_id) {
     std::lock_guard lock {DD_DATA.mutex};
+    DD_DATA.idle_saver.begin_connection();
     if (!DD_DATA.sm_instance) {
       // Platform is not supported, nothing to do.
       return configuration_result_e::ready;
@@ -932,17 +964,51 @@ namespace display_device {
     std::lock_guard lock {DD_DATA.mutex};
     if (DD_DATA.configuration_owner && *DD_DATA.configuration_owner == session_id) {
       BOOST_LOG(info) << "Cancelling display preparation for an expired streaming request.";
+      DD_DATA.idle_saver.request(DD_DATA.idle_saver.generation());
       revert_configuration_unlocked(revert_option_e::try_indefinitely_with_delay);
     }
   }
 
-  void revert_configuration() {
+  void revert_configuration(bool start_screen_saver) {
     std::lock_guard lock {DD_DATA.mutex};
+    if (start_screen_saver) {
+      DD_DATA.idle_saver.request(DD_DATA.idle_saver.generation());
+    }
     revert_configuration_unlocked(revert_option_e::try_indefinitely_with_delay);
+  }
+
+  uint64_t configuration_generation() {
+    std::lock_guard lock {DD_DATA.mutex};
+    return DD_DATA.idle_saver.generation();
+  }
+
+  void finish_stream(uint64_t generation, bool restore_display) {
+    std::lock_guard lock {DD_DATA.mutex};
+    if (!DD_DATA.idle_saver.request(generation)) {
+      BOOST_LOG(debug) << "Ignoring idle action from an older display generation.";
+      return;
+    }
+#ifdef _WIN32
+    if (!restore_display && DD_DATA.sm_instance) {
+      DD_DATA.sm_instance->schedule([](auto &, auto &stop_token) {
+        if (DD_DATA.idle_saver.complete([]() {
+              return platf::start_screen_saver();
+            })) {
+          stop_token.requestStop();
+        }
+      },
+                                    {.m_sleep_durations = {DEFAULT_RETRY_INTERVAL}});
+      return;
+    }
+#endif
+    if (restore_display) {
+      revert_configuration_unlocked(revert_option_e::try_indefinitely_with_delay);
+    }
   }
 
   bool reset_persistence() {
     std::lock_guard lock {DD_DATA.mutex};
+    DD_DATA.idle_saver.cancel();
     DD_DATA.configuration_owner.reset();
     if (!DD_DATA.sm_instance) {
       // Platform is not supported, assume success.
