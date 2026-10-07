@@ -40,6 +40,7 @@ namespace {
     unsigned int start_requests {};
     bool suspend_ok {true};
     bool start_ok {true};
+    int current_desktop {10};
     std::deque<std::optional<bool>> running_results;
     std::optional<bool> running {false};
 
@@ -122,8 +123,11 @@ namespace {
     /**
      * @brief Record a screen saver close request without posting a Windows message.
      */
-    display_preparation_e close_screen_saver(int) {
+    display_preparation_e close_screen_saver(int desktop) {
       ++closes;
+      if (desktop != current_desktop) {
+        return display_preparation_e::failed;
+      }
       return close_result;
     }
 
@@ -139,7 +143,11 @@ namespace {
      */
     bool set_thread_desktop(int desktop) {
       calls.emplace_back("attach:" + std::to_string(desktop));
-      return desktop == 10 ? restore_ok : attach_ok;
+      const bool success = desktop == 10 ? restore_ok : attach_ok;
+      if (success) {
+        current_desktop = desktop;
+      }
+      return success;
     }
 
     /**
@@ -210,7 +218,7 @@ namespace {
     ASSERT_EQ(prepared.status, display_preparation_e::ready);
     EXPECT_EQ(api.closes, 1);
     EXPECT_EQ(api.waits, 2);
-    EXPECT_EQ(api.calls, (std::vector<std::string> {"wake", "open", "close:20", "open", "close:21", "open", "attach:22"}));
+    EXPECT_EQ(api.calls, (std::vector<std::string> {"wake", "open", "attach:20", "attach:10", "close:20", "open", "close:21", "open", "attach:22"}));
     prepared.guard.reset();
     EXPECT_EQ(api.calls.back(), "close:22");
   }
@@ -222,7 +230,7 @@ namespace {
     EXPECT_EQ(api.closes, 1);
     EXPECT_EQ(api.waits, 30);
     EXPECT_EQ(api.calls.back(), "failure");
-    EXPECT_EQ(std::count(api.calls.begin(), api.calls.end(), "attach:10"), 0);
+    EXPECT_EQ(std::count(api.calls.begin(), api.calls.end(), "attach:10"), 1);
   }
 
   TEST(DisplayPreparationTest, CloseFailureDoesNotContinueToDisplayConfiguration) {

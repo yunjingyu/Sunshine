@@ -235,6 +235,11 @@ namespace platf {
             return {};
           }
           if (*input && !close_requested) {
+            // Window messages are scoped to the calling thread's desktop. Attach
+            // this fresh worker to the verified nonsecure saver before closing it.
+            if (!guard->attach()) {
+              return {};
+            }
             const auto close_status = api.close_screen_saver(desktop);
             if (close_status != display_preparation_e::ready) {
               return {close_status, nullptr};
